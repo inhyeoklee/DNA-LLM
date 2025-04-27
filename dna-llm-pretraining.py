@@ -16,61 +16,26 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from contextlib import nullcontext
+import argparse
+import matplotlib.pyplot as plt
+import json
 
-#%% Download and Prepare the Genome Dataset
-# Download GRCh38 genome if not already present
-os.makedirs("data", exist_ok=True)
-fasta_file = os.path.join("data", "genome.fa")
-if not os.path.isfile(fasta_file):
-    print("Downloading GRCh38 reference genome...")
-    os.system(f"wget -O - https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz | gunzip -c > {fasta_file}")
+parser = argparse.ArgumentParser(description="gLM pretraining")
+parser.add_argument('--data_dir', type=str, default='data/full', help='data directory for bins and meta')
+parser.add_argument('--output_dir', type=str, default='outputs', help='directory to save benchmarks')
+args = parser.parse_args()
+data_dir = args.data_dir
+output_dir = args.output_dir
+os.makedirs(data_dir, exist_ok=True)
+os.makedirs(output_dir, exist_ok=True)
+mode = os.path.basename(data_dir.rstrip('/\\'))
 
-# Read genome into memory
-with open(fasta_file, "r") as f:
-    raw_text = f.read()
-
-# Build vocabulary and encoder/decoder
-chars = sorted(list(set(raw_text)))
-vocab_size = len(chars)
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-def encode(s): return [stoi[c] for c in s]
-def decode(l): return "".join([itos[i] for i in l])
-
-# Save metadata for later fine-tuning
-meta = {'vocab_size': vocab_size, 'itos': itos, 'stoi': stoi}
-with open("data/meta.pkl", "wb") as f:
-    pickle.dump(meta, f)
-
-#%% Tokenization: Split, Encode, and Save as Binary
-# 90/10 train/val split
-n = len(raw_text)
-train_text = raw_text[:int(n*0.9)]
-val_text   = raw_text[int(n*0.9):]
-del raw_text
-
-# Helper to append tokens to a binary file
-def append_to_bin(path, arr):
-    with open(path, "ab") as f:
-        arr.tofile(f)
-
-# Create empty files
-for split in ["train","val"]:
-    open(f"data/{split}.bin","wb").close()
-
-# Encode in chunks to avoid RAM blowup
-for i in np.arange(0,1,0.05):
-    start_t = int(len(train_text)*i)
-    end_t   = int(len(train_text)*(i+0.05))
-    arr_t = np.array(encode(train_text[start_t:end_t]), dtype=np.uint16)
-    append_to_bin("data/train.bin", arr_t)
-
-    start_v = int(len(val_text)*i)
-    end_v   = int(len(val_text)*(i+0.05))
-    arr_v = np.array(encode(val_text[start_v:end_v]), dtype=np.uint16)
-    append_to_bin("data/val.bin", arr_v)
-
-print("Tokenization complete.")
+#%% Load dataset metadata
+# Use pre-generated bins from data_prep.py
+with open(os.path.join(data_dir, "meta.pkl"), "rb") as f:
+    meta = pickle.load(f)
+vocab_size = meta["vocab_size"]
+print(f"Loaded dataset from {data_dir}, vocab size = {vocab_size}")
 
 #%% Attention & Model Definitions
 def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
@@ -79,7 +44,7 @@ def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_caus
     attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
     if is_causal:
         mask = torch.ones(L, S, device=q.device).tril()
-        attn_bias = attn_bias.masked_fill(~mask, float("-inf"))
+        attn_bias = attn_bias.masked_fill(~mask.bool(), float("-inf"))
     if attn_mask is not None:
         attn_bias += attn_mask
     weights = (q @ k.transpose(-2,-1)) * scale_factor + attn_bias
@@ -201,6 +166,11 @@ class GPT(nn.Module):
         return logits, loss, attn_weights
 
 #%% Training Loop
+start_time = time.time()
+# Lists to track losses over training
+train_losses = []
+val_losses = []
+all_iterations = []
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'float16' if device=='cuda' else 'float32'
 print(f"Using {device}, dtype={dtype}")
@@ -224,13 +194,27 @@ def get_lr(it):
 
 # Fetch batch
 def get_batch(split):
-    data = np.memmap(f"data/{split}.bin", dtype=np.uint16, mode='r')
+    data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data)-300, (64,))
     x = torch.stack([torch.from_numpy(data[i:i+300].astype(np.int64)) for i in ix]).to(device)
     y = torch.stack([torch.from_numpy(data[i+1:i+301].astype(np.int64)) for i in ix]).to(device)
     return x, y
 
 # Training
+# Function to evaluate the model on train and val datasets
+def evaluate_model():
+    model.eval()
+    losses = {'train':0.0, 'val':0.0}
+    for split in ['train','val']:
+        lsum=0.0
+        for _ in range(100):
+            Xv,Yv = get_batch(split)
+            _,l,_ = model(Xv,Yv)
+            lsum += l.item()
+        losses[split] = lsum/100
+    return losses
+
+# Main training loop
 while iter_num < max_iters:
     lr = get_lr(iter_num)
     for pg in optimizer.param_groups: pg['lr']=lr
@@ -241,22 +225,110 @@ while iter_num < max_iters:
     optimizer.zero_grad(); loss.backward(); optimizer.step()
 
     if iter_num % eval_interval == 0:
-        model.eval()
-        losses = {'train':0.0, 'val':0.0}
-        for split in ['train','val']:
-            lsum=0.0
-            for _ in range(100):
-                Xv,Yv = get_batch(split)
-                _,l,_ = model(Xv,Yv)
-                lsum += l.item()
-            losses[split] = lsum/100
+        losses = evaluate_model()
+        train_losses.append(losses['train'])
+        val_losses.append(losses['val'])
+        all_iterations.append(iter_num)
         print(f"Iter {iter_num}: train={losses['train']:.4f}, val={losses['val']:.4f}")
         if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
             ckpt = {'model_args': model_args, 'model': model.state_dict(),
                     'best_val_loss': best_val_loss, 'iter': iter_num}
-            torch.save(ckpt, "out/ckpt.pt")
-            print("Saved checkpoint")
+            ckpt_path = os.path.join(output_dir, f"ckpt_{mode}.pt")
+            torch.save(ckpt, ckpt_path)
+            print(f"Saved checkpoint to {ckpt_path}")
     iter_num += 1
 
+# Final evaluation at max_iters
+losses = evaluate_model()
+train_losses.append(losses['train'])
+val_losses.append(losses['val'])
+all_iterations.append(max_iters)
+print(f"Iter {max_iters}: train={losses['train']:.4f}, val={losses['val']:.4f}")
+
 print("Pretraining complete.")
+end_time = time.time()
+elapsed = end_time - start_time
+print(f"Total training time: {elapsed:.2f}s")
+
+# Plot the loss curves
+plt.figure()
+plt.plot(all_iterations, train_losses, label='train')
+plt.plot(all_iterations, val_losses, label='val')
+plt.title('Loss curves')
+plt.xlabel('Iteration')
+plt.ylabel('Loss')
+plt.legend()
+plt.savefig(os.path.join(output_dir, f"loss_{mode}.png"))
+print(f"Saved loss curve to {os.path.join(output_dir, f'loss_{mode}.png')}")
+plt.show()
+
+# Save loss data and timing information for future reference
+loss_data = {
+    "iterations": all_iterations,
+    "train_losses": train_losses,
+    "val_losses": val_losses,
+    "elapsed_time": elapsed,
+    "vocab_size": vocab_size
+}
+with open(os.path.join(output_dir, f"losses_{mode}.json"), "w") as f:
+    json.dump(loss_data, f)
+print(f"Saved loss data to {os.path.join(output_dir, f'losses_{mode}.json')}")
+
+# Write summary
+summary = {
+    "elapsed_time": elapsed,
+    "best_val_loss": best_val_loss,
+    "checkpoint": ckpt_path,
+    "loss_curve": os.path.join(output_dir, f"loss_{mode}.png"),
+    "loss_data": os.path.join(output_dir, f"losses_{mode}.json")
+}
+with open(os.path.join(output_dir, f"summary_{mode}.json"), "w") as f:
+    json.dump(summary, f)
+print(f"Saved summary to {os.path.join(output_dir, f'summary_{mode}.json')}")
+
+#%% Plot Training Time Comparison
+# If we've just finished training the vocab4 dataset, also generate a training time comparison plot
+if mode == 'vocab4':
+    try:
+        # Try to load loss data files for both configurations
+        loss_data_files = {}
+        for config in ['full', 'vocab4']:
+            loss_data_path = os.path.join(output_dir, f"losses_{config}.json")
+            if os.path.exists(loss_data_path):
+                with open(loss_data_path, 'r') as f:
+                    loss_data_files[config] = json.load(f)
+        
+        # If we have both loss data files, create a comparison plot
+        if len(loss_data_files) == 2:
+            plt.figure(figsize=(10, 6))
+            configs = list(loss_data_files.keys())
+            times = [loss_data_files[config]['elapsed_time'] for config in configs]
+            vocab_sizes = [loss_data_files[config]['vocab_size'] for config in configs]
+            
+            # Create bar chart
+            bars = plt.bar(configs, times, color=['steelblue', 'darkorange'])
+            
+            # Add labels and title
+            plt.xlabel('Configuration')
+            plt.ylabel('Training Time (seconds)')
+            plt.title('DNA-LLM Pretraining Time Comparison')
+            
+            # Add exact training time as text on each bar
+            for i, bar in enumerate(bars):
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 10,
+                        f'{times[i]:.2f}s\nVocab Size: {vocab_sizes[i]}',
+                        ha='center', va='bottom')
+            
+            # Add grid for better readability
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Save and show the plot
+            plt.savefig(os.path.join(output_dir, 'training_time_comparison.png'))
+            print(f"Saved training time comparison to {os.path.join(output_dir, 'training_time_comparison.png')}")
+            plt.show()
+    except Exception as e:
+        print(f"Could not generate training time comparison: {e}")
+
+# %%
