@@ -80,7 +80,7 @@ class TFBindingDataset(Dataset):
         original_scores = self.all_scores[actual_idx] # This is already a numpy array
 
         if self.augment and self.max_shift > 0: # Only augment if max_shift > 0
-            # --- Find motifs first to determine valid shift range ---
+            #  Find motifs first to determine valid shift range 
             motifs = []
             i = 0
             while i <= self.window_size - self.motif_len:
@@ -93,7 +93,7 @@ class TFBindingDataset(Dataset):
                 else:
                     i += 1
 
-            # --- Determine shift amount based on motifs ---
+            #  Determine shift amount based on motifs 
             if motifs:
                 min_motif_start = min(m['start'] for m in motifs)
                 # Calculate end position (exclusive) for the rightmost motif
@@ -113,7 +113,7 @@ class TFBindingDataset(Dataset):
                 # No motifs found, allow full shift range as before
                 shift_amount = random.randint(-self.max_shift, self.max_shift)
 
-            # --- Apply the calculated shift ---
+            #  Apply the calculated shift 
             # Initialize shifted tensors
             shifted_ids = np.full(self.window_size, self.pad_token_id, dtype=np.int64)
             shifted_scores = np.zeros(self.window_size, dtype=np.float32)
@@ -355,7 +355,7 @@ def train():
     gpt.load_state_dict(ckpt['model'])
     model = GPTRegressor(gpt).to(device)
 
-    # --- Data Loading and Splitting ---
+    #  Data Loading and Splitting 
     print("Loading and preprocessing data...")
     # Load all data first
     all_seqs = pd.read_csv(SEQ_PATH, sep="\t", compression="gzip")["sequence"]

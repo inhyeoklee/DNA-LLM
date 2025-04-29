@@ -114,7 +114,7 @@ class TFBindingDataset(Dataset):
         original_scores = self.all_scores[actual_idx] # This is already a numpy array
 
         if self.augment and self.max_shift > 0:
-            # --- Find motifs first to determine valid shift range ---
+            #  Find motifs first to determine valid shift range 
             motifs = []
             i = 0
             while i <= self.window_size - self.motif_len:
@@ -126,7 +126,7 @@ class TFBindingDataset(Dataset):
                 else:
                     i += 1
 
-            # --- Determine shift amount based on motifs ---
+            #  Determine shift amount based on motifs 
             if motifs:
                 min_motif_start = min(m['start'] for m in motifs)
                 max_motif_end = max(m['start'] + self.motif_len for m in motifs)
@@ -136,7 +136,7 @@ class TFBindingDataset(Dataset):
             else:
                 shift_amount = random.randint(-self.max_shift, self.max_shift)
 
-            # --- Apply the calculated shift ---
+            #  Apply the calculated shift 
             # Initialize shifted sequence with padding chars
             shifted_sequence_list = list(self.pad_char * self.window_size)
             shifted_scores = np.zeros(self.window_size, dtype=np.float32)
@@ -243,7 +243,7 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Data Loading and Splitting ---
+    #  Data Loading and Splitting 
     print("Loading and preprocessing data...")
     try:
         all_seqs_df = pd.read_csv(SEQ_PATH, sep="\t", compression="gzip")
